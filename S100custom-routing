@@ -1,0 +1,142 @@
+#!/bin/sh
+
+ENABLED=yes
+PROCS="sing-box-routing"
+DESC="Custom Routing for sing-box"
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+MONITOR_INTERVAL=10  # Interval in seconds between checks
+WAIT_INTERVAL=2      # Interval to wait between interface checks
+WAIT_TIMEOUT=30      # Maximum wait time for interface availability
+MONITOR_PID_FILE="/opt/var/run/sing-box-routing.pid"  # File to store monitor PID
+INTERNET_CHECK_URL="https://www.google.com"  # URL to check internet connectivity
+
+wait_for_interface() {
+    local interface=$1
+    local timeout=$WAIT_TIMEOUT
+    echo "Waiting for interface $interface to become available..."
+
+    while ! ip link show "$interface" > /dev/null 2>&1; do
+        sleep $WAIT_INTERVAL
+        timeout=$((timeout - WAIT_INTERVAL))
+        if [ "$timeout" -le 0 ]; then
+            echo "Error: Interface $interface not available after $WAIT_TIMEOUT seconds."
+            return 1
+        fi
+    done
+
+    echo "Interface $interface is available."
+    return 0
+}
+
+check_internet() {
+    echo "Checking internet connectivity..."
+    if curl -s --head --request GET "$INTERNET_CHECK_URL" | grep "200 OK" > /dev/null; then
+        echo "Internet connection is active."
+        return 0
+    else
+        echo "No internet connection detected."
+        return 1
+    fi
+}
+
+add_routes_and_rules() {
+    if ! wait_for_interface "singtun0"; then
+        echo "Aborting route and rule setup due to missing interface."
+        return 1
+    fi
+
+    # Add default route for singtun0
+    ip route add default dev singtun0 src 244.0.0.0 table 100 2>/dev/null || echo "Route already exists."
+
+    # Check if rule already exists before adding
+    if ! ip rule show | grep -q "from 192.168.3.0/24 lookup 100"; then
+        ip rule add from 192.168.3.0/24 lookup 100 || echo "Failed to add rule."
+    else
+        echo "Rule already exists."
+    fi
+}
+
+remove_routes_and_rules() {
+    # Remove default route for singtun0
+    ip route del default dev singtun0 table 100 2>/dev/null || echo "Route already removed."
+
+    # Remove rule if it exists
+    if ip rule show | grep -q "from 192.168.3.0/24 lookup 100"; then
+        ip rule del from 192.168.3.0/24 lookup 100 || echo "Failed to remove rule."
+    else
+        echo "Rule already removed."
+    fi
+}
+
+start() {
+    echo "Starting $DESC..."
+    add_routes_and_rules
+
+    if [ -f "$MONITOR_PID_FILE" ] && kill -0 "$(cat $MONITOR_PID_FILE)" 2>/dev/null; then
+        echo "Monitor already running with PID $(cat $MONITOR_PID_FILE)."
+    else
+        mkdir -p "$(dirname "$MONITOR_PID_FILE")"
+        monitor &
+        echo $! > "$MONITOR_PID_FILE"
+        echo "Monitor started with PID $!"
+    fi
+
+    echo "$DESC started."
+}
+
+stop() {
+    echo "Stopping $DESC..."
+    remove_routes_and_rules
+
+    if [ -f "$MONITOR_PID_FILE" ]; then
+        PID=$(cat "$MONITOR_PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            kill "$PID"
+            echo "Monitor with PID $PID stopped."
+        else
+            echo "No running monitor found. Cleaning up PID file."
+        fi
+        rm -f "$MONITOR_PID_FILE"
+    else
+        echo "No PID file found. Monitor not running."
+    fi
+
+    echo "$DESC stopped."
+}
+
+monitor() {
+    echo "Monitoring $DESC for enforcing routes and rules..."
+    while true; do
+        add_routes_and_rules
+        
+        # Check internet connectivity and restart if needed
+        if ! check_internet; then
+            echo "Internet connectivity lost. Restarting $DESC..."
+            restart
+        fi
+        
+        sleep $MONITOR_INTERVAL
+    done
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    monitor)
+        monitor
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|monitor}"
+        exit 1
+        ;;
+esac
+
